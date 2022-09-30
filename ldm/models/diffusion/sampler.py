@@ -30,29 +30,103 @@ class Sampler(object):
                 attr = attr.to(torch.float32).to(torch.device(self.device))
         setattr(self, name, attr)
 
-    # make_schedule() is called prior to sampling() and can be used
-    # to initialize any state variables. It was originally used in
-    # the DDIM scheduler, and enhance all the ddim* variable names
-    @torch.no_grad()
+    # This method was copied over from ddim.py and probably does stuff that is
+    # ddim-specific. Disentangle at some point.
     def make_schedule(
             self,
             ddim_num_steps,
             ddim_discretize='uniform',
             ddim_eta=0.0,
-            model=None,
             verbose=False,
     ):
-        if model is not None:
-            self.model = model
-        self.ddim_num_steps = ddim_num_steps
-        self.ddim_eta = ddim_eta
-        self.ddim_discretize = ddim_discretize
-        self.verbose = verbose
         self.ddim_timesteps = make_ddim_timesteps(
             ddim_discr_method=ddim_discretize,
             num_ddim_timesteps=ddim_num_steps,
             num_ddpm_timesteps=self.ddpm_num_timesteps,
             verbose=verbose,
+        )
+        alphas_cumprod = self.model.alphas_cumprod
+        assert (
+            alphas_cumprod.shape[0] == self.ddpm_num_timesteps
+        ), 'alphas have to be defined for each timestep'
+        to_torch = (
+            lambda x: x.clone()
+            .detach()
+            .to(torch.float32)
+            .to(self.model.device)
+        )
+
+        self.register_buffer('betas', to_torch(self.model.betas))
+        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer(
+            'alphas_cumprod_prev', to_torch(self.model.alphas_cumprod_prev)
+        )
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer(
+            'sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod.cpu()))
+        )
+        self.register_buffer(
+            'sqrt_one_minus_alphas_cumprod',
+            to_torch(np.sqrt(1.0 - alphas_cumprod.cpu())),
+        )
+        self.register_buffer(
+            'log_one_minus_alphas_cumprod',
+            to_torch(np.log(1.0 - alphas_cumprod.cpu())),
+        )
+        self.register_buffer(
+            'sqrt_recip_alphas_cumprod',
+            to_torch(np.sqrt(1.0 / alphas_cumprod.cpu())),
+        )
+        self.register_buffer(
+            'sqrt_recipm1_alphas_cumprod',
+            to_torch(np.sqrt(1.0 / alphas_cumprod.cpu() - 1)),
+        )
+
+        # ddim sampling parameters
+        (
+            ddim_sigmas,
+            ddim_alphas,
+            ddim_alphas_prev,
+        ) = make_ddim_sampling_parameters(
+            alphacums=alphas_cumprod.cpu(),
+            ddim_timesteps=self.ddim_timesteps,
+            eta=ddim_eta,
+            verbose=verbose,
+        )
+        self.register_buffer('ddim_sigmas', ddim_sigmas)
+        self.register_buffer('ddim_alphas', ddim_alphas)
+        self.register_buffer('ddim_alphas_prev', ddim_alphas_prev)
+        self.register_buffer(
+            'ddim_sqrt_one_minus_alphas', np.sqrt(1.0 - ddim_alphas)
+        )
+        sigmas_for_original_sampling_steps = ddim_eta * torch.sqrt(
+            (1 - self.alphas_cumprod_prev)
+            / (1 - self.alphas_cumprod)
+            * (1 - self.alphas_cumprod / self.alphas_cumprod_prev)
+        )
+        self.register_buffer(
+            'ddim_sigmas_for_original_num_steps',
+            sigmas_for_original_sampling_steps,
+        )
+        
+    @torch.no_grad()
+    def stochastic_encode(self, x0, t, use_original_steps=False, noise=None):
+        # fast, but does not allow for exact reconstruction
+        # t serves as an index to gather the correct alphas
+        if use_original_steps:
+            sqrt_alphas_cumprod = self.sqrt_alphas_cumprod
+            sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod
+        else:
+            sqrt_alphas_cumprod = torch.sqrt(self.ddim_alphas)
+            sqrt_one_minus_alphas_cumprod = self.ddim_sqrt_one_minus_alphas
+
+        if noise is None:
+            noise = torch.randn_like(x0)
+        return (
+            extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0
+            + extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape)
+            * noise
         )
 
     @torch.no_grad()
@@ -109,25 +183,7 @@ class Sampler(object):
         )
         return samples, intermediates
 
-    @torch.no_grad()
-    def stochastic_encode(self, x0, t, use_original_steps=False, noise=None):
-        # fast, but does not allow for exact reconstruction
-        # t serves as an index to gather the correct alphas
-        if use_original_steps:
-            sqrt_alphas_cumprod = self.sqrt_alphas_cumprod
-            sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod
-        else:
-            sqrt_alphas_cumprod = torch.sqrt(self.ddim_alphas)
-            sqrt_one_minus_alphas_cumprod = self.ddim_sqrt_one_minus_alphas
-
-        if noise is None:
-            noise = torch.randn_like(x0)
-        return (
-            extract_into_tensor(sqrt_alphas_cumprod, t, x0.shape) * x0
-            + extract_into_tensor(sqrt_one_minus_alphas_cumprod, t, x0.shape)
-            * noise
-        )
-
+    #torch.no_grad()
     def do_sampling(
             self,
             cond,
@@ -223,6 +279,66 @@ class Sampler(object):
                 intermediates['pred_x0'].append(pred_x0)
 
         return img, intermediates
+
+    @torch.no_grad()
+    def decode(
+            self,
+            x_latent,
+            cond,
+            t_start,
+            img_callback=None,
+            unconditional_guidance_scale=1.0,
+            unconditional_conditioning=None,
+            use_original_steps=False,
+            init_latent       = None,
+            mask              = None,
+    ):
+
+        timesteps = (
+            np.arange(self.ddpm_num_timesteps)
+            if use_original_steps
+            else self.ddim_timesteps
+        )
+        timesteps = timesteps[:t_start]
+
+        time_range = np.flip(timesteps)
+        total_steps = timesteps.shape[0]
+        print(f'>> Running self.__class__.__name__ Sampling with {total_steps} timesteps')
+
+        iterator = tqdm(time_range, desc='Decoding image', total=total_steps)
+        x_dec = x_latent
+        x0    = init_latent
+
+        for i, step in enumerate(iterator):
+            index = total_steps - i - 1
+            ts = torch.full(
+                (x_latent.shape[0],),
+                step,
+                device=x_latent.device,
+                dtype=torch.long,
+            )
+
+            if mask is not None:
+                assert x0 is not None
+                xdec_orig = self.model.q_sample(
+                    x0, ts
+                )  # TODO: deterministic forward pass?
+                x_dec = xdec_orig * mask + (1.0 - mask) * x_dec
+
+            x_dec, _ = self.p_sample_ddim(
+                x_dec,
+                cond,
+                ts,
+                index=index,
+                use_original_steps=use_original_steps,
+                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=unconditional_conditioning,
+            )
+
+            if img_callback:
+                img_callback(x_dec, i)
+
+        return x_dec
 
     def get_initial_image(self,x_T,shape,timesteps=None):
         if x_T is None:

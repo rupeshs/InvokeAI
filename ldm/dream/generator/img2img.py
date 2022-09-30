@@ -36,8 +36,9 @@ class Img2Img(Generator):
         def make_image(x_T):
             # this is for debugging only
             image_debug = self.sample_to_image(self.init_latent)
-            print(f'DEBUG: saving base image to outputs/img-samples/intermediates')
-            image_debug.save(f'./outputs/img-samples/intermediates/000-base.png','PNG')
+            #print(f'DEBUG: saving base image to outputs/img-samples/intermediates')
+            #image_debug.save(f'./outputs/img-samples/intermediates/000-base.png','PNG')
+
             # encode (scaled latent)
             z_enc = sampler.stochastic_encode(
                 self.init_latent,

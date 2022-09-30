@@ -43,16 +43,17 @@ class KSampler(Sampler):
             ddim_num_steps,
             ddim_discretize='uniform',
             ddim_eta=0.0,
-            model=None,
             verbose=False,
     ):
+        outer_model = self.model
+        self.model  = outer_model.inner_model
         super().make_schedule(
             ddim_num_steps,
             ddim_discretize='uniform',
             ddim_eta=0.0,
-            model = model,
             verbose=False,
         )
+        self.model = outer_model
         print(f'ddim_num_steps={ddim_num_steps}') # want total steps here (50)
         sigmas = K.sampling.get_sigmas_karras(
             n=ddim_num_steps,
@@ -60,11 +61,74 @@ class KSampler(Sampler):
             sigma_max=self.model.sigmas[-1].item(),
             rho=7.,
             device=self.device,
-            # must be a birch-san enhancement
+            # Birch-san recommends this, but it doesn't match the call signature in his branch of k-diffusion
             # concat_zero=False
         )
         self.sigmas = sigmas
         
+    # ALERT: We are completely overriding the sample() method in the base class, which
+    # means that inpainting will (probably?) not work correctly. To get this to work
+    # we need to be able to modify the inner loop of k_heun, k_lms, etc, as is done
+    # in an ugly way in the lstein/k-diffusion branch.
+    
+    # Most of these arguments are ignored and are only present for compatibility with
+    # other samples
+    @torch.no_grad()
+    def sample(
+        self,
+        S,
+        batch_size,
+        shape,
+        conditioning=None,
+        callback=None,
+        normals_sequence=None,
+        img_callback=None,
+        quantize_x0=False,
+        eta=0.0,
+        mask=None,
+        x0=None,
+        temperature=1.0,
+        noise_dropout=0.0,
+        score_corrector=None,
+        corrector_kwargs=None,
+        verbose=True,
+        x_T=None,
+        log_every_t=100,
+        unconditional_guidance_scale=1.0,
+        unconditional_conditioning=None,
+        # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
+        **kwargs,
+    ):
+        def route_callback(k_callback_values):
+            if img_callback is not None:
+                img_callback(k_callback_values['x'])
+
+        # sigmas = self.model.get_sigmas(S)
+        # sigmas are now set up in make_schedule - we take the last steps items
+        sigmas = self.sigmas[-S:]
+        print(f'DEBUG: sigmas = {sigmas}')
+        
+        if x_T is not None:
+            x = x_T * sigmas[0]
+        else:
+            x = (
+                torch.randn([batch_size, *shape], device=self.device)
+                * sigmas[0]
+            )   # for GPU draw
+        model_wrap_cfg = CFGDenoiser(self.model)
+        extra_args = {
+            'cond': conditioning,
+            'uncond': unconditional_conditioning,
+            'cond_scale': unconditional_guidance_scale,
+        }
+        return (
+            K.sampling.__dict__[f'sample_{self.schedule}'](
+                model_wrap_cfg, x, sigmas, extra_args=extra_args,
+                callback=route_callback
+            ),
+            None,
+        )
+
     @torch.no_grad()
     def p_sample(
             self,
