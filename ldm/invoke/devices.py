@@ -2,7 +2,7 @@ import torch
 from torch import autocast
 from contextlib import nullcontext
 
-def choose_torch_device() -> str:
+def choose_torch_device(device=None) -> str:
     '''Convenience routine for guessing which GPU device to run model on'''
     if torch.cuda.is_available():
         return 'cuda'
