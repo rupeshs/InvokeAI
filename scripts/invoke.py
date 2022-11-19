@@ -225,7 +225,8 @@ def main_loop(gen, opt):
 
         if opt.prompt_as_dir and operation == 'generate':
             # sanitize the prompt to a valid folder name
-            subdir = path_filter.sub('_', opt.prompt)[:name_max].rstrip(' .')
+            _subdir = path_filter.sub('_', opt.prompt)[:name_max].rstrip(' .')
+            subdir = "_".join(re.split(":| ", _subdir))
 
             # truncate path to maximum allowed length
             # 39 is the length of '######.##########.##########-##.png', plus two separators and a NUL
