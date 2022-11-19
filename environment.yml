@@ -1,4 +1,4 @@
-name: invokeai
+name: sdimgenv
 channels:
   - pytorch
   - conda-forge
